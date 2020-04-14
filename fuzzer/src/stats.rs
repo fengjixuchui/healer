@@ -12,6 +12,7 @@ use tokio::fs::write;
 use tokio::sync::broadcast;
 use tokio::time;
 use tokio::time::Duration;
+use std::process::exit;
 
 pub struct StatSource {
     pub corpus: Arc<Corpus>,
@@ -42,6 +43,16 @@ pub struct SamplerConf {
     pub report_interval: u64,
 }
 
+impl SamplerConf {
+    pub fn check(&self) {
+        if self.sample_interval < 10 || self.report_interval <= 10 ||
+            self.sample_interval < report_interval * 60 {
+            eprintln!("Config Error: invalid sample conf");
+            exit(exitcode::CONFIG)
+        }
+    }
+}
+
 pub struct Sampler {
     pub source: StatSource,
     pub stats: CircularQueue<Stats>,
@@ -53,9 +64,9 @@ impl Sampler {
     pub async fn sample(&mut self, conf: &Option<SamplerConf>) {
         let (sample_interval, report_interval) = match conf {
             Some(SamplerConf {
-                sample_interval,
-                report_interval,
-            }) => {
+                     sample_interval,
+                     report_interval,
+                 }) => {
                 assert!(*sample_interval < *report_interval * 60);
                 (
                     Duration::new(*sample_interval, 0),

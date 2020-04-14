@@ -11,6 +11,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Child;
 use tokio::sync::oneshot;
+use std::net::ToSocketAddrs;
 
 // config for executor
 #[derive(Debug, Deserialize)]
@@ -19,6 +20,21 @@ pub struct ExecutorConf {
     pub host_ip: Option<String>,
     pub concurrency: bool,
     pub memleak_check: bool,
+}
+
+impl ExecutorConf {
+    pub fn check(&self) {
+        if !self.path.is_file() {
+            eprintln!("Config Error: executor executable file {} not exists", self.path.display());
+            exit(exitcode::CONFIG)
+        }
+        if let Some(ip) = &self.host_ip {
+            if let Err(e) = ip.to_socket_addrs() {
+                eprintln!("Config Error: invalid host ip {}: {}", self.host_ip.as_ref().unwrap(), e);
+                exit(exitcode::CONFIG)
+            }
+        }
+    }
 }
 
 pub struct Executor {

@@ -11,6 +11,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use tokio::process::Child;
 use tokio::time::{delay_for, timeout, Duration};
+use std::process::exit;
 
 lazy_static! {
     static ref QEMUS: HashMap<String, App> = {
@@ -104,6 +105,22 @@ pub struct GuestConf {
     pub platform: String,
 }
 
+pub const PLATFORM: [&str; 1] = ["qemu"];
+pub const ARCH: [&str; 1] = ["amd64"];
+pub const OS: [&str; 1] = ["os"];
+
+
+impl GuestConf {
+    pub fn check(&self) {
+        if !PLATFORM.contains(&self.platform.as_str()) ||
+            !ARCH.contains(&self.arch.as_str()) ||
+            !OS.contains(&self.os.as_str()) {
+            eprintln!("Config Error: unsupported guest: ({})", (&self.platform, &self.arch, &self.os));
+            exit(exitcode::CONFIG)
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct QemuConf {
     pub cpu_num: u32,
@@ -113,9 +130,44 @@ pub struct QemuConf {
     pub wait_boot_time: Option<u8>,
 }
 
+impl QemuConf {
+    pub fn check(&self) {
+        let cpu_num = num_cpus::get() as u32;
+        if self.cpu_num > cpu_num || self.cpu_num == 0 {
+            eprintln!("Config Error: invalid cpu num {}, cpu num must between (0, {}] on your system", self.cpu_num, cpu_num);
+            exit(exitcode::CONFIG)
+        }
+
+        if self.mem_size < 512 {
+            eprintln!("Config Error: invalid mem size {}, mem size must bigger than 512 bytes", self.cpu_num, cpu_num);
+            exit(exitcode::CONFIG)
+        }
+        let image = PathBuf::from(&self.image);
+        let kernel = PathBuf::from(&self.kernel);
+        if !image.is_file() {
+            eprintln!("Config Error: image {} not exists", self.image);
+            exit(exitcode::CONFIG)
+        }
+        if !kernel.is_file() {
+            eprintln!("Config Error: kernel {} not exists", self.kernel);
+            exit(exitcode::CONFIG)
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SSHConf {
     pub key_path: String,
+}
+
+impl SSHConf {
+    pub fn check(&self) {
+        let key = PathBuf::from(&self.key_path);
+        if !key.is_file() {
+            eprintln!("Config Error: ssh key file {} not exists", self.key_path);
+            exit(exitcode::CONFIG)
+        }
+    }
 }
 
 pub enum Guest {
@@ -299,7 +351,7 @@ impl LinuxQemu {
             self.port,
             App::new("pwd"),
         )
-        .into_cmd();
+            .into_cmd();
         pwd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());

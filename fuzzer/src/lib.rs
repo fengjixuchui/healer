@@ -41,11 +41,12 @@ pub mod stats;
 use crate::stats::SamplerConf;
 use stats::StatSource;
 use std::process::exit;
+use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    pub fots_bin: String,
-    pub curpus: Option<String>,
+    pub fots_bin: PathBuf,
+    pub corpus: Option<PathBuf>,
     pub vm_num: usize,
 
     pub guest: GuestConf,
@@ -58,9 +59,45 @@ pub struct Config {
     pub sampler: Option<SamplerConf>,
 }
 
-pub async fn fuzz(cfg: Config) {
+impl Config {
+    pub fn check(&self) {
+        if !self.fots_bin.is_file() {
+            eprintln!("Config Error: fots file {} not exists", self.fots_bin.display());
+            exit(exitcode::CONFIG)
+        }
+        if let Some(corpus) = &self.corpus {
+            if !corpus.is_file() {
+                eprintln!("Config Error: corpus file {} not exists", self.fots_bin.display());
+                exit(exitcode::CONFIG)
+            }
+        }
+
+        let cpu_num = num_cpus::get();
+        if self.vm_num == 0 || self.vm_num > cpu_num {
+            eprintln!("Config Error: invalid vm num {}, vm num must between (0,{}] on your system", self.vm_num, cpu_num);
+            exit(exitcode::CONFIG)
+        }
+        self.guest.check();
+        self.executor.check();
+        if let Some(qemu) = self.qemu.as_ref() {
+            qemu.check()
+        }
+        if let Some(ssh) = self.ssh.as_ref() {
+            ssh.check()
+        }
+        if let Some(mail) = self.mail.as_ref() {
+            mail.check()
+        }
+        if let Some(sampler) = self.sampler.as_ref() {
+            sampler.check()
+        }
+    }
+}
+
+pub fn start_up(cfg: Config) {
     let cfg = Arc::new(cfg);
-    let work_dir = std::env::var("HEALER_WORK_DIR").unwrap_or_else(|_| String::from("."));
+    let work_dir = String::from(".");
+
     let (target, candidates) = tokio::join!(load_target(&cfg), load_candidates(&cfg.curpus));
     info!("Corpus: {}", candidates.len().await);
 
@@ -158,21 +195,21 @@ async fn load_target(cfg: &Config) -> Target {
     Target::from(items)
 }
 
-pub async fn prepare_env() {
+pub fn init_env() {
+    use std::io::ErrorKind;
+
     // pretty_env_logger::init_timed();
     init_logger();
     let pid = process::id();
     std::env::set_var("HEALER_FUZZER_PID", format!("{}", pid));
     info!("Pid: {}", pid);
 
-    let work_dir = std::env::var("HEALER_WORK_DIR").unwrap_or_else(|_| String::from("."));
-    std::env::set_var("HEALER_WORK_DIR", &work_dir);
-    info!("Work-dir: {}", work_dir);
+    // let work_dir = std::env::var("HEALER_WORK_DIR").unwrap_or_else(|_| String::from("."));
+    // std::env::set_var("HEALER_WORK_DIR", &work_dir);
+    // info!("Work-dir: {}", work_dir);
 
-    use tokio::io::ErrorKind::*;
-
-    if let Err(e) = create_dir_all(format!("{}/crashes", work_dir)).await {
-        if e.kind() != AlreadyExists {
+    if let Err(e) = create_dir_all("./crashes") {
+        if e.kind() != ErrorKind::AlreadyExists {
             exits!(exitcode::IOERR, "Fail to create crash dir: {}", e);
         }
     }
@@ -249,3 +286,17 @@ fn init_logger() {
 //     }
 //     result
 // }
+
+const HEALER: &str = r"
+ ___   ___   ______   ________   __       ______   ______
+/__/\ /__/\ /_____/\ /_______/\ /_/\     /_____/\ /_____/\
+\::\ \\  \ \\::::_\/_\::: _  \ \\:\ \    \::::_\/_\:::_ \ \
+ \::\/_\ .\ \\:\/___/\\::(_)  \ \\:\ \    \:\/___/\\:(_) ) )_
+  \:: ___::\ \\::___\/_\:: __  \ \\:\ \____\::___\/_\: __ `\ \
+   \: \ \\::\ \\:\____/\\:.\ \  \ \\:\/___/\\:\____/\\ \ `\ \ \
+    \__\/ \::\/ \_____\/ \__\/\__\/ \_____\/ \_____\/ \_\/ \_\/
+
+";
+pub fn show_info(){
+    println!("{}", HEALER);
+}

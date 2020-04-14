@@ -7,6 +7,7 @@ use serde::Deserialize;
 use std::env;
 use std::sync::Once;
 use tokio::sync::Mutex;
+use std::process::exit;
 
 static mut MAILER: Option<Mutex<SmtpTransport>> = None;
 static mut ENVELOPE: Option<Envelope> = None;
@@ -16,6 +17,53 @@ static ONCE: Once = Once::new();
 pub struct MailConf {
     pub sender: String,
     pub receivers: Vec<String>,
+}
+
+impl MailConf {
+    pub fn check(&self) {
+        ONCE.call_once(|| {
+            let passwd = env::var("HEALER_MAIL_PASSWD").unwrap_or_else(|| {
+                eprintln!("Config Error: HEALER_MAIL_PASSWD env not found");
+                exit(exitcode::CONFIG)
+            });
+
+            let creds = Credentials::new(self.sender.clone(), passwd);
+            let tls = TlsConnector::builder();
+            let param = ClientTlsParameters::new("smtp-mail.outlook.com".into(), tls.build().unwrap());
+            let mailer = SmtpClient::new(
+                ("smtp-mail.outlook.com", 587),
+                ClientSecurity::Required(param),
+            )
+                .unwrap()
+                .credentials(creds)
+                .connection_reuse(ConnectionReuseParameters::ReuseUnlimited)
+                .smtp_utf8(true)
+                .transport();
+
+            let sender_addr = EmailAddress::new(self.sender.clone()).unwrap_or_else(|e| {
+                eprintln!("Config Error: invalid sender addr {}: {}", self.sender, e);
+                exit(exitcode::CONFIG)
+            });
+            let recivers = self.receivers
+                .iter()
+                .map(|r| EmailAddress::new(r.clone()).unwrap_or_else(|e| {
+                    eprintln!("Config Error: invalid reciver addr {}: {}", self.sender, e);
+                    exit(exitcode::CONFIG)
+                }))
+                .collect();
+
+            let envelope = Envelope::new(
+                Some(sender_addr),
+                recivers,
+            )
+                .unwrap();
+
+            unsafe {
+                MAILER = Some(Mutex::new(mailer));
+                ENVELOPE = Some(envelope);
+            }
+        })
+    }
 }
 
 pub async fn send(mail: EmailBuilder) {
@@ -31,33 +79,5 @@ pub async fn send(mail: EmailBuilder) {
 }
 
 pub fn init(conf: &MailConf) {
-    ONCE.call_once(|| {
-        let passwd = env::var("HEALER_MAIL_PASSWD").unwrap();
-        let creds = Credentials::new(conf.sender.clone(), passwd);
-        let tls = TlsConnector::builder();
-        let param = ClientTlsParameters::new("smtp-mail.outlook.com".into(), tls.build().unwrap());
-        let mailer = SmtpClient::new(
-            ("smtp-mail.outlook.com", 587),
-            ClientSecurity::Required(param),
-        )
-        .unwrap()
-        .credentials(creds)
-        .connection_reuse(ConnectionReuseParameters::ReuseUnlimited)
-        .smtp_utf8(true)
-        .transport();
-
-        let envelope = Envelope::new(
-            Some(EmailAddress::new(conf.sender.clone()).unwrap()),
-            conf.receivers
-                .iter()
-                .map(|r| EmailAddress::new(r.clone()).unwrap())
-                .collect(),
-        )
-        .unwrap();
-
-        unsafe {
-            MAILER = Some(Mutex::new(mailer));
-            ENVELOPE = Some(envelope);
-        }
-    })
+    todo!()
 }
