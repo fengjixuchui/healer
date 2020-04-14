@@ -6,7 +6,6 @@ use core::prog::Prog;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::io::{Read, Write};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct Header {
@@ -56,21 +55,21 @@ pub fn send<T: Serialize, S: Write>(v: &T, out: &mut S) -> Result<(), Error> {
     Ok(())
 }
 
-pub async fn async_send<T: Serialize, S: AsyncWrite + Unpin>(
-    p: &T,
-    out: &mut S,
-) -> Result<(), Error> {
-    let len = bincode::serialized_size(p)? as u32;
-    let header = Header { len };
-    let header = bincode::serialize(&header)?;
-    let body = bincode::serialize(p)?;
+// pub async fn async_send<T: Serialize, S: AsyncWrite + Unpin>(
+//     p: &T,
+//     out: &mut S,
+// ) -> Result<(), Error> {
+//     let len = bincode::serialized_size(p)? as u32;
+//     let header = Header { len };
+//     let header = bincode::serialize(&header)?;
+//     let body = bincode::serialize(p)?;
+//
+//     out.write_all(&header).await?;
+//     out.write_all(&body).await?;
+//     Ok(())
+// }
 
-    out.write_all(&header).await?;
-    out.write_all(&body).await?;
-    Ok(())
-}
-
-pub async fn async_recv_result<T: AsyncRead + Unpin>(src: &mut T) -> Result<ExecResult, Error> {
+pub fn recv_result<T: Read>(src: &mut T) -> Result<ExecResult, Error> {
     let header = Header::default();
     let headler_len = bincode::serialized_size(&header)? as usize;
     let mut header_buf = BytesMut::with_capacity(headler_len);
@@ -78,7 +77,7 @@ pub async fn async_recv_result<T: AsyncRead + Unpin>(src: &mut T) -> Result<Exec
     unsafe {
         header_buf.set_len(headler_len);
     }
-    src.read_exact(&mut header_buf).await?;
+    src.read_exact(&mut header_buf)?;
     let header: Header = bincode::deserialize(&header_buf)?;
 
     let body_len = header.len as usize;
@@ -86,7 +85,7 @@ pub async fn async_recv_result<T: AsyncRead + Unpin>(src: &mut T) -> Result<Exec
     unsafe {
         body_buf.set_len(body_len);
     }
-    src.read_exact(&mut body_buf).await?;
+    src.read_exact(&mut body_buf)?;
 
     bincode::deserialize(&body_buf).map_err(|e| e.into())
 }
