@@ -3,15 +3,16 @@ use crate::guest::{Crash, Guest};
 use crate::utils::cli::{App, Arg, OptVal};
 use crate::Config;
 use core::prog::Prog;
-use executor::transfer::{async_recv_result, async_send};
-use executor::ExecResult;
+use executor::transfer::{recv_result, send};
+use executor::{ExecResult, Reason};
+use std::io::Read;
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::exit;
-use tokio::io::AsyncReadExt;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::process::Child;
-use tokio::sync::oneshot;
-use std::net::ToSocketAddrs;
+use std::process::Child;
+use std::sync::mpsc::sync_channel;
+use std::thread::{sleep, spawn};
+use std::time::Duration;
 
 // config for executor
 #[derive(Debug, Deserialize)]
@@ -25,12 +26,20 @@ pub struct ExecutorConf {
 impl ExecutorConf {
     pub fn check(&self) {
         if !self.path.is_file() {
-            eprintln!("Config Error: executor executable file {} not exists", self.path.display());
+            eprintln!(
+                "Config Error: executor executable file {} not exists",
+                self.path.display()
+            );
             exit(exitcode::CONFIG)
         }
         if let Some(ip) = &self.host_ip {
-            if let Err(e) = ip.to_socket_addrs() {
-                eprintln!("Config Error: invalid host ip {}: {}", self.host_ip.as_ref().unwrap(), e);
+            let addr = format!("{}:8080", ip);
+            if let Err(e) = addr.to_socket_addrs() {
+                eprintln!(
+                    "Config Error: invalid host ip `{}`: {}",
+                    self.host_ip.as_ref().unwrap(),
+                    e
+                );
                 exit(exitcode::CONFIG)
             }
         }
@@ -52,15 +61,15 @@ impl Executor {
         }
     }
 
-    pub async fn start(&mut self) {
+    pub fn start(&mut self) {
         match self.inner {
-            ExecutorImpl::Linux(ref mut e) => e.start().await,
+            ExecutorImpl::Linux(ref mut e) => e.start(),
         }
     }
 
-    pub async fn exec(&mut self, p: &Prog) -> Result<ExecResult, Option<Crash>> {
+    pub fn exec(&mut self, p: &Prog) -> Result<ExecResult, Crash> {
         match self.inner {
-            ExecutorImpl::Linux(ref mut e) => e.exec(p).await,
+            ExecutorImpl::Linux(ref mut e) => e.exec(p),
         }
     }
 }
@@ -98,40 +107,24 @@ impl LinuxExecutor {
             concurrency: cfg.executor.concurrency,
             memleak_check: cfg.executor.memleak_check,
             executor_bin_path: cfg.executor.path.clone(),
-            target_path: PathBuf::from(&cfg.fots_bin),
+            target_path: cfg.fots_bin.clone(),
             host_ip,
         }
     }
 
-    pub async fn start(&mut self) {
+    pub fn start(&mut self) {
         // handle should be set to kill on drop
         self.exec_handle = None;
-        self.guest.boot().await;
-
-        self.start_executer().await
+        self.guest.boot();
+        self.start_executer()
     }
 
-    pub async fn start_executer(&mut self) {
-        self.exec_handle = None;
-        let target = self.guest.copy(&self.target_path).await;
+    fn start_executer(&mut self) {
+        use std::io::ErrorKind;
 
-        let (tx, rx) = oneshot::channel();
+        let target = self.guest.copy(&self.target_path);
+        let (tx, rx) = sync_channel(1);
         let host_addr = format!("{}:{}", self.host_ip, self.port);
-        tokio::spawn(async move {
-            let mut listener = TcpListener::bind(&host_addr).await.unwrap_or_else(|e| {
-                exits!(exitcode::OSERR, "Fail to listen on {}: {}", host_addr, e)
-            });
-            match listener.accept().await {
-                Ok((conn, addr)) => {
-                    info!("connected from: {}", addr);
-                    tx.send(conn).unwrap();
-                }
-                Err(e) => {
-                    eprintln!("Executor driver: fail to get client: {}", e);
-                    exit(exitcode::OSERR);
-                }
-            }
-        });
 
         let mut executor = App::new(self.executor_bin_path.to_str().unwrap())
             .arg(Arg::new_opt("-t", OptVal::normal(target.to_str().unwrap())))
@@ -150,53 +143,87 @@ impl LinuxExecutor {
             executor = executor.arg(Arg::new_flag("-c"));
         }
 
-        self.exec_handle = Some(self.guest.run_cmd(&executor).await);
-        self.conn = Some(rx.await.unwrap());
-        info!("executor started.");
-    }
-
-    pub async fn exec(&mut self, p: &Prog) -> Result<ExecResult, Option<Crash>> {
-        // send must be success
-        assert!(self.conn.is_some());
-        async_send(p, self.conn.as_mut().unwrap()).await.unwrap();
-
-        match async_recv_result(self.conn.as_mut().unwrap()).await {
-            Ok(result) => {
-                self.guest.clear().await;
-                if let ExecResult::Failed(ref reason) = result {
-                    let rea = reason.to_string();
-                    if rea.contains("CRASH-MEMLEAK") {
-                        return Err(Some(Crash { inner: rea }));
+        spawn(move || {
+            let listener = TcpListener::bind(&host_addr).unwrap_or_else(|e| {
+                exits!(exitcode::OSERR, "Fail to listen on {}: {}", host_addr, e)
+            });
+            listener
+                .set_nonblocking(true)
+                .expect("Cannot set non-blocking");
+            let mut try_time = 0;
+            loop {
+                match listener.accept() {
+                    Ok((conn, addr)) => {
+                        info!("connected from: {}", addr);
+                        tx.send(conn).unwrap();
+                        break;
+                    }
+                    Err(e) => {
+                        if e.kind() == ErrorKind::WouldBlock {
+                            if try_time <= 50 {
+                                sleep(Duration::from_millis(100));
+                                try_time += 1;
+                            } else {
+                                error!("Wait timeout of executor connection");
+                                exit(exitcode::IOERR)
+                            }
+                        } else {
+                            error!("Fail to wait executor connection: {}", e);
+                            exit(exitcode::IOERR)
+                        }
                     }
                 }
-                return Ok(result);
+            }
+        });
+
+        self.exec_handle = Some(self.guest.run_cmd(&executor));
+        self.conn = Some(rx.recv().unwrap());
+    }
+
+    pub fn exec(&mut self, p: &Prog) -> Result<ExecResult, Crash> {
+        // send must be success
+        assert!(self.conn.is_some());
+        send(p, self.conn.as_mut().unwrap()).unwrap();
+
+        match recv_result(self.conn.as_mut().unwrap()) {
+            Ok(result) => {
+                self.guest.clear();
+                if self.memleak_check {
+                    if let ExecResult::Failed(ref reason) = result {
+                        let rea = reason.to_string();
+                        if rea.contains("CRASH-MEMLEAK") {
+                            return Err(Crash { inner: rea });
+                        }
+                    }
+                }
+                Ok(result)
             }
             Err(_) => {
-                if !self.guest.is_alive().await {
-                    return Err(self.guest.try_collect_crash().await);
+                if !self.guest.is_alive() {
+                    Err(self.guest.collect_crash())
                 } else {
+                    // executor crashed
                     let mut handle = self.exec_handle.take().unwrap();
                     let mut stdout = handle.stdout.take().unwrap();
                     let mut stderr = handle.stderr.take().unwrap();
-                    handle.await.unwrap_or_else(|e| {
+                    handle.wait().unwrap_or_else(|e| {
                         exits!(exitcode::OSERR, "Fail to wait executor handle:{}", e)
                     });
 
                     let mut err = Vec::new();
-                    stderr.read_to_end(&mut err).await.unwrap();
+                    stderr.read_to_end(&mut err).unwrap();
                     let mut out = Vec::new();
-                    stdout.read_to_end(&mut out).await.unwrap();
+                    stdout.read_to_end(&mut out).unwrap();
 
                     warn!(
                         "Executor: Connection lost. STDOUT:{}. STDERR: {}",
                         String::from_utf8(out).unwrap(),
                         String::from_utf8(err).unwrap()
                     );
-                    self.start_executer().await;
+                    self.start_executer();
+                    Ok(ExecResult::Failed(Reason("Executor crashed".into())))
                 }
             }
         }
-        // Caused by internal err
-        Ok(ExecResult::Ok(Vec::new()))
     }
 }
