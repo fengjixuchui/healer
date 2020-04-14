@@ -3,15 +3,14 @@ use crate::utils::cli::{App, Arg, OptVal};
 use crate::Config;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use os_pipe::{pipe, PipeReader, PipeWriter};
-use serde::export::Formatter;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{ErrorKind, Read};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use tokio::process::Child;
-use tokio::time::{delay_for, timeout, Duration};
-use std::process::exit;
+use std::process::{exit, Child};
+use std::thread::sleep;
+use std::time::Duration;
 
 lazy_static! {
     static ref QEMUS: HashMap<String, App> = {
@@ -77,7 +76,7 @@ lazy_static! {
                 "-o",
                 OptVal::normal("StrictHostKeyChecking=no"),
             ))
-            .arg(Arg::new_opt("-o", OptVal::normal("ConnectTimeout=10s")))
+            .arg(Arg::new_opt("-o", OptVal::normal("ConnectTimeout=3s")))
     };
     pub static ref SCP: App = {
         App::new("scp")
@@ -107,15 +106,18 @@ pub struct GuestConf {
 
 pub const PLATFORM: [&str; 1] = ["qemu"];
 pub const ARCH: [&str; 1] = ["amd64"];
-pub const OS: [&str; 1] = ["os"];
-
+pub const OS: [&str; 1] = ["linux"];
 
 impl GuestConf {
     pub fn check(&self) {
-        if !PLATFORM.contains(&self.platform.as_str()) ||
-            !ARCH.contains(&self.arch.as_str()) ||
-            !OS.contains(&self.os.as_str()) {
-            eprintln!("Config Error: unsupported guest: ({})", (&self.platform, &self.arch, &self.os));
+        if !PLATFORM.contains(&self.platform.as_str())
+            || !ARCH.contains(&self.arch.as_str())
+            || !OS.contains(&self.os.as_str())
+        {
+            eprintln!(
+                "Config Error: unsupported guest: {:?}",
+                (&self.platform, &self.arch, &self.os)
+            );
             exit(exitcode::CONFIG)
         }
     }
@@ -134,12 +136,18 @@ impl QemuConf {
     pub fn check(&self) {
         let cpu_num = num_cpus::get() as u32;
         if self.cpu_num > cpu_num || self.cpu_num == 0 {
-            eprintln!("Config Error: invalid cpu num {}, cpu num must between (0, {}] on your system", self.cpu_num, cpu_num);
+            eprintln!(
+                "Config Error: invalid cpu num {}, cpu num must between (0, {}] on your system",
+                self.cpu_num, cpu_num
+            );
             exit(exitcode::CONFIG)
         }
 
         if self.mem_size < 512 {
-            eprintln!("Config Error: invalid mem size {}, mem size must bigger than 512 bytes", self.cpu_num, cpu_num);
+            eprintln!(
+                "Config Error: invalid mem size {}, mem size must bigger than 512 bytes",
+                self.mem_size
+            );
             exit(exitcode::CONFIG)
         }
         let image = PathBuf::from(&self.image);
@@ -183,43 +191,43 @@ impl Guest {
 
 impl Guest {
     /// Boot guest or panic
-    pub async fn boot(&mut self) {
+    pub fn boot(&mut self) {
         match self {
-            Guest::LinuxQemu(ref mut guest) => guest.boot().await,
+            Guest::LinuxQemu(ref mut guest) => guest.boot(),
         }
     }
 
     /// Judge if guest is  still alive
-    pub async fn is_alive(&self) -> bool {
+    pub fn is_alive(&self) -> bool {
         match self {
-            Guest::LinuxQemu(ref guest) => guest.is_alive().await,
+            Guest::LinuxQemu(ref guest) => guest.is_alive(),
         }
     }
 
     /// Run command on guest,return handle or crash
-    pub async fn run_cmd(&self, app: &App) -> Child {
+    pub fn run_cmd(&self, app: &App) -> Child {
         match self {
-            Guest::LinuxQemu(ref guest) => guest.run_cmd(app).await,
+            Guest::LinuxQemu(ref guest) => guest.run_cmd(app),
         }
     }
 
     /// Try collect crash info guest, this could be none sometimes
-    pub async fn try_collect_crash(&mut self) -> Option<Crash> {
+    pub fn collect_crash(&mut self) -> Crash {
         match self {
-            Guest::LinuxQemu(ref mut guest) => guest.try_collect_crash().await,
+            Guest::LinuxQemu(ref mut guest) => guest.collect_crash(),
         }
     }
 
-    pub async fn clear(&mut self) {
+    pub fn clear(&mut self) {
         match self {
-            Guest::LinuxQemu(ref mut guest) => guest.clear().await,
+            Guest::LinuxQemu(ref mut guest) => guest.clear(),
         }
     }
 
     /// Copy file from host to guest, return path in guest or crash
-    pub async fn copy<T: AsRef<Path>>(&self, path: T) -> PathBuf {
+    pub fn copy<T: AsRef<Path>>(&self, path: T) -> PathBuf {
         match self {
-            Guest::LinuxQemu(ref guest) => guest.copy(path).await,
+            Guest::LinuxQemu(ref guest) => guest.copy(path),
         }
     }
 }
@@ -238,7 +246,7 @@ impl Default for Crash {
 }
 
 impl fmt::Display for Crash {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.inner)
     }
 }
@@ -287,7 +295,7 @@ impl LinuxQemu {
 }
 
 impl LinuxQemu {
-    async fn boot(&mut self) {
+    fn boot(&mut self) {
         const MAX_RETRY: u8 = 5;
 
         if let Some(ref mut h) = self.handle {
@@ -308,7 +316,6 @@ impl LinuxQemu {
                 .stdin(std::process::Stdio::piped())
                 .stdout(wp)
                 .stderr(wp2)
-                .kill_on_drop(true)
                 .spawn()
                 .unwrap_or_else(|e| exits!(exitcode::OSERR, "Fail to spawn qemu:{}", e));
 
@@ -316,10 +323,11 @@ impl LinuxQemu {
         };
 
         let mut retry = 1;
+        let wait_time = Duration::new(self.wait_boot_time as u64, 0);
         loop {
-            delay_for(Duration::new(self.wait_boot_time as u64, 0)).await;
+            sleep(wait_time);
 
-            if self.is_alive().await {
+            if self.is_alive() {
                 break;
             }
 
@@ -343,7 +351,7 @@ impl LinuxQemu {
         self.rp = Some(rp);
     }
 
-    async fn is_alive(&self) -> bool {
+    fn is_alive(&self) -> bool {
         let mut pwd = ssh_app(
             &self.key,
             &self.user,
@@ -351,41 +359,37 @@ impl LinuxQemu {
             self.port,
             App::new("pwd"),
         )
-            .into_cmd();
+        .into_cmd();
         pwd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        match timeout(Duration::new(10, 0), pwd.status()).await {
-            Err(_) => false,
-            Ok(status) => match status {
-                Ok(status) => status.success(),
-                Err(e) => exits!(exitcode::OSERR, "Fail to spawn detector(ssh:pwd):{}", e),
-            },
+        match pwd.status() {
+            Ok(status) => status.success(),
+            Err(e) => exits!(exitcode::OSERR, "Fail to spawn detector(ssh:pwd):{}", e),
         }
     }
 
-    async fn run_cmd(&self, app: &App) -> Child {
+    fn run_cmd(&self, app: &App) -> Child {
         assert!(self.handle.is_some());
 
         let mut app = app.clone();
-        let bin = self.copy(PathBuf::from(&app.bin)).await;
+        let bin = self.copy(PathBuf::from(&app.bin));
         app.bin = String::from(bin.to_str().unwrap());
         let mut app = ssh_app(&self.key, &self.user, &self.addr, self.port, app).into_cmd();
         app.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
             .spawn()
             .unwrap_or_else(|e| exits!(exitcode::OSERR, "Fail to spawn:{}", e))
     }
 
-    async fn clear(&mut self) {
+    fn clear(&mut self) {
         if let Some(r) = self.rp.as_mut() {
             read_all_nonblock(r);
         }
     }
 
-    pub async fn copy<T: AsRef<Path>>(&self, path: T) -> PathBuf {
+    pub fn copy<T: AsRef<Path>>(&self, path: T) -> PathBuf {
         let path = path.as_ref();
         assert!(path.is_file());
 
@@ -407,7 +411,6 @@ impl LinuxQemu {
         let output = scp
             .into_cmd()
             .output()
-            .await
             .unwrap_or_else(|e| panic!("Failed to spawn:{}", e));
 
         if !output.status.success() {
@@ -416,18 +419,14 @@ impl LinuxQemu {
         guest_path
     }
 
-    async fn try_collect_crash(&mut self) -> Option<Crash> {
+    fn collect_crash(&mut self) -> Crash {
         assert!(self.rp.is_some());
-        match timeout(Duration::new(2, 0), self.handle.as_mut().unwrap()).await {
-            Err(_e) => None,
-            Ok(_) => {
-                self.handle = None;
-                let crash = read_all_nonblock(self.rp.as_mut().unwrap());
-                let crash_info = String::from_utf8_lossy(&crash).to_string();
-                self.rp = None;
-                Some(Crash { inner: crash_info })
-            }
-        }
+        let mut handle = self.handle.take().unwrap();
+        handle.kill().unwrap();
+        let mut rp = self.rp.take().unwrap();
+        let crash = read_all_nonblock(&mut rp);
+        let crash_info = String::from_utf8_lossy(&crash).to_string();
+        Crash { inner: crash_info }
     }
 }
 
