@@ -12,19 +12,18 @@ use crate::fuzzer::Fuzzer;
 use crate::guest::{GuestConf, QemuConf, SSHConf};
 use crate::mail::MailConf;
 use crate::report::TestCaseRecord;
-use crate::utils::queue::CQueue;
 
 use circular_queue::CircularQueue;
 use core::analyze::static_analyze;
 use core::prog::Prog;
 use core::target::Target;
 use fots::types::Items;
+use std::fs::{create_dir_all, read, write};
 use std::process;
-use std::sync::Arc;
-use tokio::fs::{create_dir_all, read};
-use tokio::signal::ctrl_c;
-use tokio::sync::Mutex;
-use tokio::sync::{broadcast, Barrier};
+use std::sync::Barrier;
+use std::sync::Mutex;
+use std::sync::{Arc, RwLock};
+use std::thread::spawn;
 
 #[macro_use]
 pub mod utils;
@@ -40,8 +39,8 @@ pub mod stats;
 
 use crate::stats::SamplerConf;
 use stats::StatSource;
-use std::process::exit;
 use std::path::PathBuf;
+use std::process::exit;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -62,19 +61,28 @@ pub struct Config {
 impl Config {
     pub fn check(&self) {
         if !self.fots_bin.is_file() {
-            eprintln!("Config Error: fots file {} not exists", self.fots_bin.display());
+            eprintln!(
+                "Config Error: fots file {} not exists",
+                self.fots_bin.display()
+            );
             exit(exitcode::CONFIG)
         }
         if let Some(corpus) = &self.corpus {
             if !corpus.is_file() {
-                eprintln!("Config Error: corpus file {} not exists", self.fots_bin.display());
+                eprintln!(
+                    "Config Error: corpus file {} not exists",
+                    self.fots_bin.display()
+                );
                 exit(exitcode::CONFIG)
             }
         }
 
         let cpu_num = num_cpus::get();
         if self.vm_num == 0 || self.vm_num > cpu_num {
-            eprintln!("Config Error: invalid vm num {}, vm num must between (0,{}] on your system", self.vm_num, cpu_num);
+            eprintln!(
+                "Config Error: invalid vm num {}, vm num must between (0,{}] on your system",
+                self.vm_num, cpu_num
+            );
             exit(exitcode::CONFIG)
         }
         self.guest.check();
@@ -95,29 +103,21 @@ impl Config {
 }
 
 pub fn start_up(cfg: Config) {
-    let cfg = Arc::new(cfg);
-    let work_dir = String::from(".");
-
-    let (target, candidates) = tokio::join!(load_target(&cfg), load_candidates(&cfg.curpus));
-    info!("Corpus: {}", candidates.len().await);
-
+    let target = load_target(&cfg);
+    let progs = load_candidates(&cfg.corpus);
+    info!("Corpus: {}", progs.len());
     if let Some(mail_conf) = cfg.mail.as_ref() {
-        mail::init(mail_conf);
         info!("Email report to: {:?}", mail_conf.receivers);
     }
 
     // shared between multi tasks
     let target = Arc::new(target);
-    let candidates = Arc::new(candidates);
     let corpus = Arc::new(Corpus::default());
     let feedback = Arc::new(FeedBack::default());
-    let record = Arc::new(TestCaseRecord::new(target.clone(), work_dir.clone()));
-    let rt = Arc::new(Mutex::new(static_analyze(&target)));
-
-    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let record = Arc::new(TestCaseRecord::new(target.clone()));
+    let rt = Arc::new(RwLock::new(static_analyze(&target)));
 
     let barrier = Arc::new(Barrier::new(cfg.vm_num + 1));
-
     info!(
         "Booting {} {}/{} on {} ...",
         cfg.vm_num, cfg.guest.os, cfg.guest.arch, cfg.guest.platform
@@ -125,68 +125,75 @@ pub fn start_up(cfg: Config) {
     let now = std::time::Instant::now();
 
     for _ in 0..cfg.vm_num {
-        let cfg = cfg.clone();
-
         let fuzzer = Fuzzer {
             rt: rt.clone(),
             target: target.clone(),
             conf: Default::default(),
-            candidates: candidates.clone(),
-
             corpus: corpus.clone(),
             feedback: feedback.clone(),
             record: record.clone(),
-
-            shutdown: shutdown_tx.subscribe(),
-            work_dir: work_dir.clone(),
         };
-
         let barrier = barrier.clone();
+        let mut executor = Executor::new(&cfg);
+        let progs = progs.clone();
 
-        tokio::spawn(async move {
-            let mut executor = Executor::new(&cfg);
-            executor.start().await;
-            barrier.wait().await;
-            fuzzer.fuzz(executor).await;
+        spawn(move || {
+            executor.start();
+            barrier.wait();
+            fuzzer.fuzz(executor, progs);
         });
     }
 
-    barrier.wait().await;
+    barrier.wait();
     info!("Boot finished, cost {}s.", now.elapsed().as_secs());
-
-    tokio::spawn(async move {
-        ctrl_c().await.expect("failed to listen for event");
-        shutdown_tx.send(()).unwrap();
-        warn!("Stopping, persisting data...");
-        while shutdown_tx.receiver_count() != 0 {}
-    });
-    let mut sampler = stats::Sampler {
+    let sampler = Arc::new(stats::Sampler {
         source: StatSource {
-            corpus,
+            corpus: corpus.clone(),
             feedback,
-            candidates,
-            record,
+            record: record.clone(),
         },
-        stats: CircularQueue::with_capacity(1024),
-        shutdown: shutdown_rx,
-        work_dir,
-    };
-    sampler.sample(&cfg.sampler).await;
+        stats: Mutex::new(CircularQueue::with_capacity(1024)),
+    });
+
+    let sampler_ = sampler.clone();
+    spawn(move || {
+        use signal_hook::{iterator::Signals, SIGINT, SIGTERM};
+        let sigs = Signals::new(&[SIGINT, SIGTERM]).unwrap();
+        for sig in sigs.forever() {
+            warn!("sig-{} received, persisting data...", sig);
+
+            let corpus_path = "./corpus".to_string();
+            let corpus = corpus
+                .dump()
+                .unwrap_or_else(|e| exits!(exitcode::DATAERR, "Fail to dump corpus: {}", e));
+            write(&corpus_path, corpus).unwrap_or_else(|e| {
+                exits!(
+                    exitcode::IOERR,
+                    "Fail to persist corpus to {} : {}",
+                    corpus_path,
+                    e
+                )
+            });
+            record.psersist();
+            sampler_.persist();
+            exit(exitcode::OK)
+        }
+    });
+
+    sampler.sample(&cfg.sampler);
 }
 
-async fn load_candidates(path: &Option<String>) -> CQueue<Prog> {
+fn load_candidates(path: &Option<PathBuf>) -> Vec<Prog> {
     if let Some(path) = path.as_ref() {
-        let data = read(path).await.unwrap();
-        let progs: Vec<Prog> = bincode::deserialize(&data).unwrap();
-
-        CQueue::from(progs)
+        let data = read(path).unwrap();
+        bincode::deserialize(&data).unwrap()
     } else {
-        CQueue::default()
+        Vec::default()
     }
 }
 
-async fn load_target(cfg: &Config) -> Target {
-    let items = Items::load(&read(&cfg.fots_bin).await.unwrap_or_else(|e| {
+fn load_target(cfg: &Config) -> Target {
+    let items = Items::load(&read(&cfg.fots_bin).unwrap_or_else(|e| {
         error!("Fail to load fots file: {}", e);
         exit(exitcode::DATAERR);
     }))
@@ -297,6 +304,7 @@ const HEALER: &str = r"
     \__\/ \::\/ \_____\/ \__\/\__\/ \_____\/ \_____\/ \_\/ \_\/
 
 ";
-pub fn show_info(){
+
+pub fn show_info() {
     println!("{}", HEALER);
 }

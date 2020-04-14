@@ -11,22 +11,20 @@ use executor::Reason;
 use lettre_email::EmailBuilder;
 use serde::Serialize;
 use std::collections::HashSet;
+use std::fs::write;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::fs::write;
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 
 pub struct TestCaseRecord {
     normal: Mutex<CircularQueue<ExecutedCase>>,
     failed: Mutex<CircularQueue<FailedCase>>,
     crash: Mutex<CircularQueue<CrashedCase>>,
-
     target: Arc<Target>,
-    id_n: Mutex<usize>,
-    work_dir: String,
-
-    normal_num: Mutex<usize>,
-    failed_num: Mutex<usize>,
-    crashed_num: Mutex<usize>,
+    id_n: AtomicUsize,
+    normal_num: AtomicUsize,
+    failed_num: AtomicUsize,
+    crashed_num: AtomicUsize,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -68,22 +66,20 @@ pub struct CrashedCase {
 
 #[allow(clippy::len_without_is_empty)]
 impl TestCaseRecord {
-    pub fn new(t: Arc<Target>, work_dir: String) -> Self {
+    pub fn new(t: Arc<Target>) -> Self {
         Self {
             normal: Mutex::new(CircularQueue::with_capacity(1024 * 64)),
             failed: Mutex::new(CircularQueue::with_capacity(1024 * 64)),
             crash: Mutex::new(CircularQueue::with_capacity(1024)),
             target: t,
-
-            id_n: Mutex::new(0),
-            work_dir,
-            normal_num: Mutex::new(0),
-            failed_num: Mutex::new(0),
-            crashed_num: Mutex::new(0),
+            id_n: AtomicUsize::new(0),
+            normal_num: AtomicUsize::new(0),
+            failed_num: AtomicUsize::new(0),
+            crashed_num: AtomicUsize::new(0),
         }
     }
 
-    pub async fn insert_executed(
+    pub fn insert_executed(
         &self,
         p: &Prog,
         blocks: &[Vec<Block>],
@@ -93,10 +89,9 @@ impl TestCaseRecord {
     ) {
         let block_num = blocks.iter().map(|blocks| blocks.len()).collect();
         let branch_num = branches.iter().map(|branches| branches.len()).collect();
-        let id = self.next_id().await;
+        let id = self.next_id();
         let title = self.title_of(&p, id);
         let stmts = to_script(&p, &self.target);
-
         let case = ExecutedCase {
             meta: TestCase {
                 id,
@@ -110,17 +105,14 @@ impl TestCaseRecord {
             new_block: new_block.len(),
         };
         {
-            let mut execs = self.normal.lock().await;
+            let mut execs = self.normal.lock().unwrap();
             execs.push(case);
         }
-        {
-            let mut exec_n = self.normal_num.lock().await;
-            *exec_n += 1;
-        }
+        self.normal_num.fetch_add(1, Ordering::SeqCst);
     }
 
-    pub async fn insert_crash(&self, p: Prog, crash: Crash, repo: bool) {
-        let id = self.next_id().await;
+    pub fn insert_crash(&self, p: Prog, crash: Crash, repo: bool) {
+        let id = self.next_id();
         let stmts = to_script(&p, &self.target);
         let case = CrashedCase {
             meta: TestCase {
@@ -133,22 +125,22 @@ impl TestCaseRecord {
             repo,
         };
 
-        self.persist_crash_case(&case).await;
+        self.persist_crash_case(&case);
 
         {
-            let mut crashes = self.crash.lock().await;
+            let mut crashes = self.crash.lock().unwrap();
             crashes.push(case);
         }
-        {
-            let mut crashed_num = self.crashed_num.lock().await;
-            *crashed_num += 1;
-        }
+        self.crashed_num.fetch_add(1, Ordering::SeqCst);
+        // {
+        //     let mut crashed_num = self.crashed_num.lock().unwrap();
+        //     *crashed_num += 1;
+        // }
     }
 
-    pub async fn insert_failed(&self, p: Prog, reason: Reason) {
-        let id = self.next_id().await;
+    pub fn insert_failed(&self, p: Prog, reason: Reason) {
+        let id = self.next_id();
         let stmts = to_script(&p, &self.target);
-
         let case = FailedCase {
             meta: TestCase {
                 id,
@@ -159,47 +151,42 @@ impl TestCaseRecord {
             reason: reason.to_string(),
         };
         {
-            let mut failed_cases = self.failed.lock().await;
+            let mut failed_cases = self.failed.lock().unwrap();
             failed_cases.push(case);
         }
-        {
-            let mut failed_num = self.failed_num.lock().await;
-            *failed_num += 1;
-        }
+        self.failed_num.fetch_add(1, Ordering::SeqCst);
+        // {
+        //     let mut failed_num = self.failed_num.lock().unwrap();
+        //     *failed_num += 1;
+        // }
     }
 
-    pub async fn psersist(&self) {
-        tokio::join!(self.persist_normal_case(), self.persist_failed_case());
+    pub fn psersist(&self) {
+        self.persist_normal_case();
+        self.persist_failed_case();
     }
 
-    pub async fn len(&self) -> (usize, usize, usize) {
-        tokio::join!(
-            async {
-                let normal_num = self.normal_num.lock().await;
-                *normal_num
-            },
-            async {
-                let failed_num = self.failed_num.lock().await;
-                *failed_num
-            },
-            async {
-                let crashed_num = self.crashed_num.lock().await;
-                *crashed_num
-            }
+    pub fn len(&self) -> (usize, usize, usize) {
+        (
+            self.normal_num.load(Ordering::SeqCst),
+            self.failed_num.load(Ordering::SeqCst),
+            self.crashed_num.load(Ordering::SeqCst),
         )
     }
 
-    async fn persist_normal_case(&self) {
-        let cases = self.normal.lock().await;
-        if cases.is_empty() {
-            return;
-        }
-        let cases = cases.asc_iter().cloned().collect::<Vec<_>>();
+    fn persist_normal_case(&self) {
+        let cases = {
+            let cases = self.normal.lock().unwrap();
+            if cases.is_empty() {
+                return;
+            }
+            cases.asc_iter().cloned().collect::<Vec<_>>()
+        };
 
-        let path = format!("{}/normal_case.json", self.work_dir);
+        let path = "./normal_case.json".to_string();
         let report = serde_json::to_string_pretty(&cases).unwrap();
 
-        write(&path, report).await.unwrap_or_else(|e| {
+        write(&path, report).unwrap_or_else(|e| {
             exits!(
                 exitcode::IOERR,
                 "Fail to persist normal test case to {} : {}",
@@ -209,15 +196,18 @@ impl TestCaseRecord {
         })
     }
 
-    async fn persist_failed_case(&self) {
-        let cases = self.failed.lock().await;
-        if cases.is_empty() {
-            return;
-        }
-        let cases = cases.asc_iter().cloned().collect::<Vec<_>>();
-        let path = format!("{}/failed_case.json", self.work_dir);
+    fn persist_failed_case(&self) {
+        let cases = {
+            let cases = self.failed.lock().unwrap();
+            if cases.is_empty() {
+                return;
+            }
+            cases.asc_iter().cloned().collect::<Vec<_>>()
+        };
+
+        let path = "./failed_case.json".to_string();
         let report = serde_json::to_string_pretty(&cases).unwrap();
-        write(&path, report).await.unwrap_or_else(|e| {
+        write(&path, report).unwrap_or_else(|e| {
             exits!(
                 exitcode::IOERR,
                 "Fail to persist failed test case to {} : {}",
@@ -227,14 +217,14 @@ impl TestCaseRecord {
         })
     }
 
-    async fn persist_crash_case(&self, case: &CrashedCase) {
-        let path = format!("{}/crashes/{}", self.work_dir, &case.meta.title);
+    fn persist_crash_case(&self, case: &CrashedCase) {
+        let path = format!("./crashes/{}", &case.meta.title);
         let crash = serde_json::to_string_pretty(case).unwrap();
         let crash_mail = EmailBuilder::new()
             .subject("Healer-Reporter: CRASH REPORT")
             .body(&crash);
-        mail::send(crash_mail).await;
-        write(&path, crash).await.unwrap_or_else(|e| {
+        mail::send(crash_mail);
+        write(&path, crash).unwrap_or_else(|e| {
             exits!(
                 exitcode::IOERR,
                 "Fail to persist failed test case to {} : {}",
@@ -250,10 +240,7 @@ impl TestCaseRecord {
         format!("{}_{}_{}", group, f, id)
     }
 
-    async fn next_id(&self) -> usize {
-        let mut id = self.id_n.lock().await;
-        let next = *id;
-        *id += 1;
-        next
+    fn next_id(&self) -> usize {
+        self.id_n.fetch_add(1, Ordering::SeqCst)
     }
 }

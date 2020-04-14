@@ -3,7 +3,6 @@ use crate::exec::Executor;
 use crate::feedback::{Block, Branch, FeedBack};
 use crate::guest::Crash;
 use crate::report::TestCaseRecord;
-use crate::utils::queue::CQueue;
 use core::analyze::prog_analyze;
 use core::analyze::RTable;
 use core::c::to_script;
@@ -15,86 +14,54 @@ use executor::{ExecResult, Reason};
 use fots::types::GroupId;
 use itertools::Itertools;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use tokio::fs::write;
-use tokio::sync::broadcast;
-use tokio::sync::Mutex;
+use std::sync::{Arc, RwLock};
 
 pub struct Fuzzer {
     pub target: Arc<Target>,
-    pub rt: Arc<Mutex<HashMap<GroupId, RTable>>>,
+    pub rt: Arc<RwLock<HashMap<GroupId, RTable>>>,
     pub conf: core::gen::Config,
-    pub work_dir: String,
-
     pub corpus: Arc<Corpus>,
     pub feedback: Arc<FeedBack>,
-    pub candidates: Arc<CQueue<Prog>>,
     pub record: Arc<TestCaseRecord>,
-    pub shutdown: broadcast::Receiver<()>,
 }
 
 impl Fuzzer {
-    pub async fn fuzz(mut self, mut executor: Executor) {
-        use broadcast::TryRecvError::*;
-        loop {
-            match self.shutdown.try_recv() {
-                Ok(_) => {
-                    self.peresist().await;
-                    drop(executor);
-                    return;
-                }
-                Err(e) => match e {
-                    Empty => (),
-                    Closed | Lagged(_) => panic!("Unexpected braodcast receiver state"),
-                },
-            }
+    pub fn fuzz(self, mut executor: Executor, corpus: Vec<Prog>) {
+        for p in corpus.into_iter() {
+            self.exec_one(p, &mut executor);
+        }
 
-            let p = self.get_prog().await;
-            match executor.exec(&p).await {
-                Ok(exec_result) => match exec_result {
-                    ExecResult::Ok(raw_branches) => {
-                        self.feedback_analyze(p, raw_branches, &mut executor).await
-                    }
-                    ExecResult::Failed(reason) => self.failed_analyze(p, reason).await,
-                },
-                Err(crash) => {
-                    self.crash_analyze(p, crash.unwrap_or_default(), &mut executor)
-                        .await
-                }
-            }
+        loop {
+            let p = {
+                let rt = self.rt.read().unwrap();
+                gen(&self.target, &rt, &self.conf)
+            };
+            self.exec_one(p, &mut executor);
         }
     }
 
-    async fn peresist(self) {
-        let corpus_path = format!("{}/corpus", self.work_dir);
-        let corpus = self
-            .corpus
-            .dump()
-            .await
-            .unwrap_or_else(|e| exits!(exitcode::DATAERR, "Fail to dump corpus: {}", e));
-        write(&corpus_path, corpus).await.unwrap_or_else(|e| {
-            exits!(
-                exitcode::IOERR,
-                "Fail to persist corpus to {} : {}",
-                corpus_path,
-                e
-            )
-        });
-        self.record.psersist().await;
+    fn exec_one(&self, p: Prog, executor: &mut Executor) {
+        match executor.exec(&p) {
+            Ok(exec_result) => match exec_result {
+                ExecResult::Ok(raw_branches) => self.feedback_analyze(p, raw_branches, executor),
+                ExecResult::Failed(reason) => self.failed_analyze(p, reason),
+            },
+            Err(crash) => self.crash_analyze(p, crash, executor),
+        }
     }
 
-    async fn failed_analyze(&self, p: Prog, reason: Reason) {
-        self.record.insert_failed(p, reason).await
+    fn failed_analyze(&self, p: Prog, reason: Reason) {
+        self.record.insert_failed(p, reason)
     }
 
-    async fn crash_analyze(&self, p: Prog, crash: Crash, executor: &mut Executor) {
+    fn crash_analyze(&self, p: Prog, crash: Crash, executor: &mut Executor) {
         warn!("========== Crashed ========= \n{}", crash);
         if !crash.inner.contains("CRASH-MEMLEAK") {
             let stmts = to_script(&p, &self.target);
             warn!("Caused by:\n{}", stmts.to_string());
             warn!("Restarting to repro ...");
-            executor.start().await;
-            match executor.exec(&p).await {
+            executor.start();
+            match executor.exec(&p) {
                 Ok(exec_result) => {
                     match exec_result {
                         ExecResult::Ok(_) => warn!("Repo failed, executed successfully"),
@@ -102,36 +69,29 @@ impl Fuzzer {
                             warn!("Repo failed, executed failed: {}", reason)
                         }
                     };
-                    self.record.insert_crash(p, crash, false).await
+                    self.record.insert_crash(p, crash, false)
                 }
                 Err(repo_crash) => {
-                    self.record
-                        .insert_crash(p, repo_crash.unwrap_or(crash), true)
-                        .await;
+                    self.record.insert_crash(p, repo_crash, true);
                     warn!("Repo successfully, restarting guest ...");
-                    executor.start().await;
+                    executor.start();
                 }
             }
         }
     }
 
-    async fn feedback_analyze(
-        &self,
-        p: Prog,
-        raw_blocks: Vec<Vec<usize>>,
-        executor: &mut Executor,
-    ) {
+    fn feedback_analyze(&self, p: Prog, raw_blocks: Vec<Vec<usize>>, executor: &mut Executor) {
         for (call_index, raw_blocks) in raw_blocks.iter().enumerate() {
-            let (new_blocks_1, new_branches_1) = self.check_new_feedback(raw_blocks).await;
+            let (new_blocks_1, new_branches_1) = self.check_new_feedback(raw_blocks);
 
             if !new_blocks_1.is_empty() || !new_branches_1.is_empty() {
                 let p = p.sub_prog(call_index);
-                let exec_result = self.exec_no_crash(executor, &p).await;
+                let exec_result = self.exec_no_crash(executor, &p);
 
                 if let ExecResult::Ok(raw_blocks) = exec_result {
                     if raw_blocks.len() == call_index + 1 {
                         let (new_block_2, new_branches_2) =
-                            self.check_new_feedback(&raw_blocks[call_index]).await;
+                            self.check_new_feedback(&raw_blocks[call_index]);
 
                         let new_block: HashSet<_> =
                             new_blocks_1.intersection(&new_block_2).cloned().collect();
@@ -141,11 +101,11 @@ impl Fuzzer {
                             .collect();
 
                         if !new_block.is_empty() || !new_branches.is_empty() {
-                            let minimized_p = self.minimize(&p, &new_block, executor).await;
-                            let raw_branches = self.exec_no_fail(executor, &minimized_p).await;
+                            let minimized_p = self.minimize(&p, &new_block, executor);
+                            let raw_branches = self.exec_no_fail(executor, &minimized_p);
                             {
                                 let g = &self.target.groups[&p.gid];
-                                let mut r = self.rt.lock().await;
+                                let mut r = self.rt.write().unwrap();
                                 prog_analyze(g, r.get_mut(&p.gid).unwrap(), &p);
                             }
 
@@ -160,17 +120,15 @@ impl Fuzzer {
                             blocks.shrink_to_fit();
                             branches.shrink_to_fit();
 
-                            self.record
-                                .insert_executed(
-                                    &minimized_p,
-                                    &blocks[..],
-                                    &branches[..],
-                                    &new_block,
-                                    &new_branches,
-                                )
-                                .await;
-                            self.corpus.insert(minimized_p).await;
-                            self.feedback.merge(new_block, new_branches).await;
+                            self.record.insert_executed(
+                                &minimized_p,
+                                &blocks[..],
+                                &branches[..],
+                                &new_block,
+                                &new_branches,
+                            );
+                            self.corpus.insert(minimized_p);
+                            self.feedback.merge(new_block, new_branches);
                         }
                     }
                 }
@@ -178,12 +136,7 @@ impl Fuzzer {
         }
     }
 
-    async fn minimize(
-        &self,
-        p: &Prog,
-        new_block: &HashSet<Block>,
-        executor: &mut Executor,
-    ) -> Prog {
+    fn minimize(&self, p: &Prog, new_block: &HashSet<Block>, executor: &mut Executor) -> Prog {
         assert!(!p.calls.is_empty());
 
         let mut p = p.clone();
@@ -197,8 +150,8 @@ impl Fuzzer {
             p_orig = p.clone();
             if !remove(&mut p, i) {
                 i += 1;
-            } else if let ExecResult::Ok(cover) = self.exec_no_crash(executor, &p).await {
-                let (new_blocks_1, _) = self.check_new_feedback(cover.last().unwrap()).await;
+            } else if let ExecResult::Ok(cover) = self.exec_no_crash(executor, &p) {
+                let (new_blocks_1, _) = self.check_new_feedback(cover.last().unwrap());
                 if new_blocks_1.is_empty() || new_blocks_1.intersection(new_block).count() == 0 {
                     i += 1;
                     p = p_orig;
@@ -211,10 +164,10 @@ impl Fuzzer {
         p
     }
 
-    async fn check_new_feedback(&self, raw_blocks: &[usize]) -> (HashSet<Block>, HashSet<Branch>) {
+    fn check_new_feedback(&self, raw_blocks: &[usize]) -> (HashSet<Block>, HashSet<Branch>) {
         let (blocks, branches) = self.cook_raw_block(raw_blocks);
-        let new_blocks = self.feedback.diff_block(&blocks[..]).await;
-        let new_branches = self.feedback.diff_branch(&branches[..]).await;
+        let new_blocks = self.feedback.diff_block(&blocks[..]);
+        let new_branches = self.feedback.diff_branch(&branches[..]);
         (new_blocks, new_branches)
     }
 
@@ -237,56 +190,32 @@ impl Fuzzer {
         (blocks, branches)
     }
 
-    async fn exec_no_crash(&self, executor: &mut Executor, p: &Prog) -> ExecResult {
-        match executor.exec(p).await {
+    fn exec_no_crash(&self, executor: &mut Executor, p: &Prog) -> ExecResult {
+        match executor.exec(p) {
             Ok(exec_result) => exec_result,
             Err(crash) => {
-                if let Some(ref crash) = crash {
-                    if crash.inner.contains("CRASH-MEMLEAK") {
-                        warn!("========== Crashed ========= \n{}", crash);
-                        return ExecResult::Failed(Reason(String::from("Mem leak detected")));
-                    }
+                if crash.inner.contains("CRASH-MEMLEAK") {
+                    warn!("========== Crashed ========= \n{}", crash);
+                    return ExecResult::Failed(Reason(String::from("Mem leak detected")));
                 }
-
-                exits!(
-                    exitcode::SOFTWARE,
-                    "Unexpected crash: {}",
-                    crash.unwrap_or_default()
-                )
+                exits!(exitcode::SOFTWARE, "Unexpected crash: {}", crash)
             }
         }
     }
 
-    async fn exec_no_fail(&self, executor: &mut Executor, p: &Prog) -> Vec<Vec<usize>> {
-        match executor.exec(p).await {
+    fn exec_no_fail(&self, executor: &mut Executor, p: &Prog) -> Vec<Vec<usize>> {
+        match executor.exec(p) {
             Ok(exec_result) => match exec_result {
                 ExecResult::Ok(raw_branches) => raw_branches,
                 ExecResult::Failed(_) => Default::default(),
             },
             Err(crash) => {
-                if let Some(ref crash) = crash {
-                    if crash.inner.contains("CRASH-MEMLEAK") {
-                        warn!("========== Crashed ========= \n{}", crash);
-                        return Default::default();
-                    }
+                if crash.inner.contains("CRASH-MEMLEAK") {
+                    warn!("========== Crashed ========= \n{}", crash);
+                    return Default::default();
                 }
 
-                exits!(
-                    exitcode::SOFTWARE,
-                    "Unexpected crash: {}",
-                    crash.unwrap_or_default()
-                )
-            }
-        }
-    }
-
-    async fn get_prog(&self) -> Prog {
-        if let Some(p) = self.candidates.pop().await {
-            p
-        } else {
-            {
-                let rt = self.rt.lock().await;
-                gen(&self.target, &rt, &self.conf)
+                exits!(exitcode::SOFTWARE, "Unexpected crash: {}", crash)
             }
         }
     }
