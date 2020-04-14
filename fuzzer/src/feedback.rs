@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::iter::Extend;
-use tokio::sync::Mutex;
+use std::sync::RwLock;
 
 #[derive(Clone, Debug, Default, Hash, PartialOrd, PartialEq, Ord, Eq)]
 pub struct Block(usize);
@@ -29,13 +29,13 @@ impl From<(Block, Block)> for Branch {
 
 #[derive(Default)]
 pub struct FeedBack {
-    branches: Mutex<HashSet<Branch>>,
-    blocks: Mutex<HashSet<Block>>,
+    branches: RwLock<HashSet<Branch>>,
+    blocks: RwLock<HashSet<Block>>,
 }
 
 impl FeedBack {
-    pub async fn diff_branch(&self, branches: &[Branch]) -> HashSet<Branch> {
-        let inner = self.branches.lock().await;
+    pub fn diff_branch(&self, branches: &[Branch]) -> HashSet<Branch> {
+        let inner = self.branches.read().unwrap();
 
         let mut result = HashSet::new();
         for b in branches {
@@ -47,8 +47,8 @@ impl FeedBack {
         result
     }
 
-    pub async fn diff_block(&self, blocks: &[Block]) -> HashSet<Block> {
-        let inner = self.blocks.lock().await;
+    pub fn diff_block(&self, blocks: &[Block]) -> HashSet<Block> {
+        let inner = self.blocks.read().unwrap();
 
         let mut result = HashSet::new();
         for b in blocks {
@@ -60,41 +60,39 @@ impl FeedBack {
         result
     }
 
-    pub async fn merge(&self, blocks: HashSet<Block>, branches: HashSet<Branch>) {
+    pub fn merge(&self, blocks: HashSet<Block>, branches: HashSet<Branch>) {
         {
-            let mut inner = self.branches.lock().await;
+            let mut inner = self.branches.write().unwrap();
             inner.extend(branches);
         }
         {
-            let mut inner = self.blocks.lock().await;
+            let mut inner = self.blocks.write().unwrap();
             inner.extend(blocks);
         }
     }
 
-    pub async fn is_empty(&self) -> bool {
-        let (block_empty, branch_empty) = tokio::join!(
-            async {
-                let inner = self.blocks.lock().await;
-                inner.is_empty()
-            },
-            async {
-                let inner = self.branches.lock().await;
-                inner.is_empty()
-            }
-        );
+    pub fn is_empty(&self) -> bool {
+        let block_empty = {
+            let inner = self.blocks.read().unwrap();
+            inner.is_empty()
+        };
+        let branch_empty = {
+            let inner = self.branches.read().unwrap();
+            inner.is_empty()
+        };
         block_empty || branch_empty
     }
 
-    pub async fn len(&self) -> (usize, usize) {
-        tokio::join!(
-            async {
-                let inner = self.blocks.lock().await;
+    pub fn len(&self) -> (usize, usize) {
+        (
+            {
+                let inner = self.blocks.read().unwrap();
                 inner.len()
             },
-            async {
-                let inner = self.branches.lock().await;
+            {
+                let inner = self.branches.read().unwrap();
                 inner.len()
-            }
+            },
         )
     }
 }
