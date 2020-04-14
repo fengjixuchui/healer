@@ -1,4 +1,4 @@
-use tokio::process::Command;
+use std::process::Command;
 
 #[derive(Clone, Debug)]
 pub struct App {
