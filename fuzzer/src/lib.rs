@@ -159,7 +159,10 @@ pub fn start_up(cfg: Config) {
 
     let sampler_ = sampler.clone();
     spawn(move || {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
         use signal_hook::{iterator::Signals, SIGINT, SIGTERM};
+
         let sigs = Signals::new(&[SIGINT, SIGTERM]).unwrap();
         for sig in sigs.forever() {
             warn!("sig-{} received, persisting data...", sig);
@@ -178,6 +181,12 @@ pub fn start_up(cfg: Config) {
             });
             record.psersist();
             sampler_.persist();
+
+            kill(Pid::from_raw(0), Some(Signal::SIGTERM)).unwrap_or_else(|e| {
+                warn!("Error: Fail to send SIGTERM to qemu: {}", e);
+                exit(exitcode::OSERR);
+            });
+
             exit(exitcode::OK)
         }
     });
