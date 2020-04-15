@@ -24,6 +24,7 @@ fn main() {
     });
     cfg.check();
     show_info();
-    init_env();
+
+    init_env(&cfg);
     start_up(cfg)
 }

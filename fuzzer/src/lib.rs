@@ -18,12 +18,12 @@ use core::analyze::static_analyze;
 use core::prog::Prog;
 use core::target::Target;
 use fots::types::Items;
+use rayon_core::spawn;
 use std::fs::{create_dir_all, read, write};
 use std::process;
 use std::sync::Barrier;
 use std::sync::Mutex;
 use std::sync::{Arc, RwLock};
-use std::thread::spawn;
 
 #[macro_use]
 pub mod utils;
@@ -165,7 +165,7 @@ pub fn start_up(cfg: Config) {
 
         let sigs = Signals::new(&[SIGINT, SIGTERM]).unwrap();
         for sig in sigs.forever() {
-            warn!("sig-{} received, persisting data...", sig);
+            warn!("SIG-{} received, persisting data...", sig);
 
             let corpus_path = "./corpus".to_string();
             let corpus = corpus
@@ -186,7 +186,6 @@ pub fn start_up(cfg: Config) {
                 warn!("Error: Fail to send SIGTERM to qemu: {}", e);
                 exit(exitcode::OSERR);
             });
-
             exit(exitcode::OK)
         }
     });
@@ -213,18 +212,23 @@ fn load_target(cfg: &Config) -> Target {
     Target::from(items)
 }
 
-pub fn init_env() {
+pub fn init_env(cfg: &Config) {
+    use rayon_core::ThreadPoolBuilder;
     use std::io::ErrorKind;
-
     // pretty_env_logger::init_timed();
     init_logger();
+
+    let cpu_num = num_cpus::get();
+    let thread_num = std::cmp::min(cfg.vm_num * 2 + 2, cpu_num * 2);
+    ThreadPoolBuilder::new()
+        .num_threads(thread_num)
+        .thread_name(|i| format!("fuzzer-{}", i))
+        .build_global()
+        .unwrap();
+
     let pid = process::id();
     std::env::set_var("HEALER_FUZZER_PID", format!("{}", pid));
     info!("Pid: {}", pid);
-
-    // let work_dir = std::env::var("HEALER_WORK_DIR").unwrap_or_else(|_| String::from("."));
-    // std::env::set_var("HEALER_WORK_DIR", &work_dir);
-    // info!("Work-dir: {}", work_dir);
 
     if let Err(e) = create_dir_all("./crashes") {
         if e.kind() != ErrorKind::AlreadyExists {

@@ -3,15 +3,16 @@ use crate::guest::{Crash, Guest};
 use crate::utils::cli::{App, Arg, OptVal};
 use crate::Config;
 use core::prog::Prog;
-use executor::transfer::{recv_result, send};
+use executor::transfer::{recv_result, send, Error};
 use executor::{ExecResult, Reason};
-use std::io::Read;
+use rayon_core::spawn;
+use std::io::{ErrorKind, Read};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::exit;
 use std::process::Child;
 use std::sync::mpsc::sync_channel;
-use std::thread::{sleep, spawn};
+use std::thread::sleep;
 use std::time::Duration;
 
 // config for executor
@@ -120,8 +121,6 @@ impl LinuxExecutor {
     }
 
     fn start_executer(&mut self) {
-        use std::io::ErrorKind;
-
         let target = self.guest.copy(&self.target_path);
         let (tx, rx) = sync_channel(1);
         let host_addr = format!("{}:{}", self.host_ip, self.port);
@@ -177,13 +176,33 @@ impl LinuxExecutor {
         });
 
         self.exec_handle = Some(self.guest.run_cmd(&executor));
-        self.conn = Some(rx.recv().unwrap());
+        let conn = rx.recv().unwrap();
+        conn.set_write_timeout(Some(Duration::new(20, 0))).unwrap();
+        conn.set_read_timeout(Some(Duration::new(20, 0))).unwrap();
+        self.conn = Some(conn);
     }
 
     pub fn exec(&mut self, p: &Prog) -> Result<ExecResult, Crash> {
         // send must be success
         assert!(self.conn.is_some());
-        send(p, self.conn.as_mut().unwrap()).unwrap();
+        if let Err(e) = send(p, self.conn.as_mut().unwrap()) {
+            match e {
+                Error::Io(e) => {
+                    if e.kind() == ErrorKind::WouldBlock {
+                        info!("Prog send blocked, restarting...");
+                        self.start();
+                        return Ok(ExecResult::Failed(Reason("Prog send blocked".into())));
+                    } else {
+                        eprintln!("Fail to send prog: {}", e);
+                        exit(exitcode::OSERR);
+                    }
+                }
+                Error::Serialize(e) => {
+                    eprintln!("Fail to serialize prog: {}", e);
+                    exit(exitcode::SOFTWARE);
+                }
+            }
+        }
 
         match recv_result(self.conn.as_mut().unwrap()) {
             Ok(result) => {
@@ -198,7 +217,21 @@ impl LinuxExecutor {
                 }
                 Ok(result)
             }
-            Err(_) => {
+            Err(e) => {
+                match e {
+                    Error::Io(e) => {
+                        if e.kind() == ErrorKind::WouldBlock {
+                            info!("Prog recv blocked, restarting...");
+                            self.start();
+                            return Ok(ExecResult::Failed(Reason("Prog send blocked".into())));
+                        }
+                    }
+                    Error::Serialize(e) => {
+                        eprintln!("Fail to deserialize recv: {}", e);
+                        exit(exitcode::SOFTWARE);
+                    }
+                }
+
                 if !self.guest.is_alive() {
                     Err(self.guest.collect_crash())
                 } else {
