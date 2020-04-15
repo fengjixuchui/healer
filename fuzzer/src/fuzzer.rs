@@ -3,6 +3,7 @@ use crate::exec::Executor;
 use crate::feedback::{Block, Branch, FeedBack};
 use crate::guest::Crash;
 use crate::report::TestCaseRecord;
+use crate::Config;
 use core::analyze::prog_analyze;
 use core::analyze::RTable;
 use core::c::to_script;
@@ -15,6 +16,7 @@ use fots::types::GroupId;
 use itertools::Itertools;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 pub struct Fuzzer {
     pub target: Arc<Target>,
@@ -26,10 +28,12 @@ pub struct Fuzzer {
 }
 
 impl Fuzzer {
-    pub fn fuzz(self, mut executor: Executor, corpus: Vec<Prog>) {
+    pub fn fuzz(self, mut executor: Executor, corpus: Vec<Prog>, cfg: Config) {
         for p in corpus.into_iter() {
             self.exec_one(p, &mut executor);
         }
+        let mut last_reboot = Instant::now();
+        let reboot_duration = Duration::new(cfg.auto_reboot_duration.unwrap_or(20) * 60, 0);
 
         loop {
             let p = {
@@ -37,6 +41,11 @@ impl Fuzzer {
                 gen(&self.target, &rt, &self.conf)
             };
             self.exec_one(p, &mut executor);
+            if last_reboot.elapsed() >= reboot_duration {
+                info!("auto restarting ...");
+                executor.start();
+                last_reboot = Instant::now();
+            }
         }
     }
 

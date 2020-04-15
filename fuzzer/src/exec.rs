@@ -15,7 +15,7 @@ use std::thread::{sleep, spawn};
 use std::time::Duration;
 
 // config for executor
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ExecutorConf {
     pub path: PathBuf,
     pub host_ip: Option<String>,

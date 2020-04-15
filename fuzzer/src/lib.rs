@@ -42,11 +42,12 @@ use stats::StatSource;
 use std::path::PathBuf;
 use std::process::exit;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub fots_bin: PathBuf,
     pub corpus: Option<PathBuf>,
     pub vm_num: usize,
+    pub auto_reboot_duration: Option<u64>,
 
     pub guest: GuestConf,
     pub qemu: Option<QemuConf>,
@@ -136,11 +137,12 @@ pub fn start_up(cfg: Config) {
         let barrier = barrier.clone();
         let mut executor = Executor::new(&cfg);
         let progs = progs.clone();
+        let cfg = cfg.clone();
 
         spawn(move || {
             executor.start();
             barrier.wait();
-            fuzzer.fuzz(executor, progs);
+            fuzzer.fuzz(executor, progs, cfg);
         });
     }
 

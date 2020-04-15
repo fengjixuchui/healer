@@ -94,7 +94,7 @@ lazy_static! {
     };
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct GuestConf {
     /// Kernel to be tested
     pub os: String,
@@ -123,7 +123,7 @@ impl GuestConf {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct QemuConf {
     pub cpu_num: u32,
     pub mem_size: u32,
@@ -163,7 +163,7 @@ impl QemuConf {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct SSHConf {
     pub key_path: String,
 }
