@@ -6,7 +6,7 @@
 ///
 /// Grammar Parser can be used to parse text by single rule.
 ///```
-/// use fots::grammar::{GrammarParser, Rule};
+/// use fots::parse::{GrammarParser, Rule};
 /// use pest::Parser;
 /// let text = "*[*i8;(0xFF,0xFFFF)]";
 /// let re = GrammarParser::parse(Rule::TypeExp, text);
@@ -16,7 +16,7 @@
 #[grammar = "fots.pest"]
 pub struct GrammarParser;
 
-// These test case need a older version of rustc, ignore for now.
+// These test cases need a older version of rustc, ignore for now.
 // #[cfg(test)]    // nightly required.
 // mod tests {
 //     use pest::Parser;
